@@ -47,8 +47,8 @@ class ParamGroup:
 class ModelParams(ParamGroup): 
     def __init__(self, parser, sentinel=False):
         self.sh_degree = 3
-        self._source_path = ""
-        self._model_path = ""
+        self._source_path = "/home/shuo/research/reproduce/GaussianPro/data/waymo/processed/training/003"
+        self._model_path = "output"
         self._images = "images"
         self._resolution = -1
         self._white_background = False
@@ -104,7 +104,7 @@ class OptimizationParams(ParamGroup):
 
         #propagation parameters
         self.dataset = 'waymo'
-        self.propagation_interval = 20
+        self.propagation_interval = 200
         self.depth_error_min_threshold = 1.0
         self.depth_error_max_threshold = 1.0
         self.propagated_iteration_begin = 1000

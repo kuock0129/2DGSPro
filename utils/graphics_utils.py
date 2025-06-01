@@ -431,7 +431,7 @@ def depth_propagation(viewpoint_cam, rendered_depth, viewpoint_stack, src_idxs, 
     poses = torch.stack(poses)
     depth_intervals = torch.stack(depth_intervals)
 
-    results = propagate(images, intrinsics, poses, depth, normal, depth_intervals, patch_size)
+    results = propagate(images, intrinsics, poses, depth, normal, depth_intervals, patch_size)# patch_size = 20
     propagated_depth = results[0].to(rendered_depth.device)
     propagated_normal = results[1:4].to(rendered_depth.device).permute(1, 2, 0)
     

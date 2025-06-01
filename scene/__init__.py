@@ -46,12 +46,22 @@ class Scene:
         elif os.path.exists(os.path.join(args.source_path, "transforms_train.json")):
             print("Found transforms_train.json file, assuming Blender data set!")
             scene_info = sceneLoadTypeCallbacks["Blender"](args.source_path, args.white_background, args.eval)
+        elif os.path.exists(os.path.join(args.source_path,"frame_info.json")):
+            print("Found frame_info.json file, assuming Waymo data set!")
+            scene_info = sceneLoadTypeCallbacks["Waymo"](path = args.source_path,  
+                                        eval = False,
+                                        load_intrinsic = True, #False,
+                                        load_c2w = True, #False,
+                                        load_sky_mask = True, #False,
+                                        start_time = 0, #0,
+                                        end_time = 197, # 100,
+                                        )
         else:
             assert False, "Could not recognize scene type!"
 
         if not self.loaded_iter:
-            with open(scene_info.ply_path, 'rb') as src_file, open(os.path.join(self.model_path, "input.ply") , 'wb') as dest_file:
-                dest_file.write(src_file.read())
+            # with open(scene_info.ply_path, 'rb') as src_file, open(os.path.join(self.model_path, "input.ply") , 'wb') as dest_file:
+            #     dest_file.write(src_file.read())
             json_cams = []
             camlist = []
             if scene_info.test_cameras:
