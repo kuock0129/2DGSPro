@@ -305,7 +305,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         with record_function("Backward"):
             loss.backward()
-        profiler.step()
         iter_end.record()
 
         with torch.no_grad():
@@ -347,8 +346,30 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             if (iteration in checkpoint_iterations):
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
                 torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
-        
+        profiler.step()
     profiler.stop()
+    if profiler.profiler is not None:  
+        print("\nProfiler Results:")
+        print("\nTop 30 by CPU time total:")
+        print(profiler.key_averages().table(
+            sort_by="cpu_time_total", row_limit=30))
+
+        print("\nTop 30 by CUDA time total:")
+        print(profiler.key_averages().table(
+            sort_by="cuda_time_total", row_limit=30))
+        
+        try:
+            trace_path = f"trace_{int(time.time())}.json" 
+            profiler.export_chrome_trace(trace_path)
+            print(f"\nProfiler trace saved to {trace_path}")
+        except RuntimeError as e:
+            if "Trace is already saved" in str(e):
+                print("\nProfiler trace was already saved")
+            else:
+                raise e
+    else:
+        print("\nProfiler was not active during training")
+
 def prepare_output_and_logger(args):    
     if not args.model_path:
         if os.getenv('OAR_JOB_ID'):
