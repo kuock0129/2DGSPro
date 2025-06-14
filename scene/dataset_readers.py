@@ -400,7 +400,7 @@ def readWaymoInfo(path,
                   load_intrinsic = False, 
                   load_c2w = False,
                   start_time = 0, end_time = -1, read_freq = 1, 
-                  num_pts = 5000, 
+                  num_pts = 3000000, 
                   voxel_size = 0.1,
                   feat_dim = 16,
                   voxel_threshould = 0.5,
@@ -542,16 +542,18 @@ def readWaymoInfo(path,
     # get split: train and test splits from timestamps
     # ------------------
     # mask
-    from sklearn.model_selection import train_test_split
-    indices = np.arange(num_frames)
-    train_indices, test_indices = train_test_split(indices, test_size=0.2, random_state=42)
     train_mask = np.zeros(num_frames, dtype=bool)
-    train_mask[train_indices] = True
+    for i in range(num_frames):
+        if i > 10 and i % 10 >= 9:
+            train_mask[i] = False
+        else:
+            train_mask[i] = True
     test_mask = ~train_mask
     # mask to index                                                                    
     train_idx = np.where(train_mask)[0]
     test_idx = np.where(test_mask)[0]
     full_idx = np.arange(num_frames)
+    print(f"train_idx: {train_idx}, test_idx: {test_idx}")
 
     # ------------------
     # load points and depth map
@@ -782,9 +784,9 @@ def readWaymoInfo(path,
                                             )
     
     
-    if not eval:
-        train_cam_infos.extend(test_cam_infos)
-        test_cam_infos = []
+    # if not eval:
+    #     train_cam_infos.extend(test_cam_infos)
+    #     test_cam_infos = []
     nerf_normalization = getNerfppNorm(train_cam_infos)
 
         

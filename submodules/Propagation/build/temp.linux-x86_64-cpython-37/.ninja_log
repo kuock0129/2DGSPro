@@ -1,0 +1,5 @@
+# ninja log v5
+0	7836	1736184092844437244	/home/shuo/research/reproduce/GaussianPro/submodules/Propagation/build/temp.linux-x86_64-cpython-37/PatchMatch.o	6fb5df87c549761c
+0	8147	1736184093155432082	/home/shuo/research/reproduce/GaussianPro/submodules/Propagation/build/temp.linux-x86_64-cpython-37/pro.o	e2b1a6e372a2960a
+0	22241	1736184107252199737	/home/shuo/research/reproduce/GaussianPro/submodules/Propagation/build/temp.linux-x86_64-cpython-37/Propagation.o	f3416efa122b4a3e
+4	7147	1736184697179485318	/home/shuo/research/reproduce/GaussianPro/submodules/Propagation/build/temp.linux-x86_64-cpython-37/PatchMatch.o	6fb5df87c549761c

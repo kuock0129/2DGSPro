@@ -48,7 +48,7 @@ class ModelParams(ParamGroup):
     def __init__(self, parser, sentinel=False):
         self.sh_degree = 3
         self._source_path = "/home/shuo/research/reproduce/GaussianPro/data/waymo/processed/training/003"
-        self._model_path = "output"
+        self._model_path = "output/2dgs"
         self._images = "images"
         self._resolution = -1
         self._white_background = False
@@ -57,6 +57,8 @@ class ModelParams(ParamGroup):
         self.load_normal = False
         self.load_depth = False
         self.eval = False
+        self.render_items = ['RGB', 'Alpha', 'Normal', 'Depth', 'Edge', 'Curvature']
+        
         super().__init__(parser, "Loading Parameters", sentinel)
 
     def extract(self, args):
@@ -68,12 +70,13 @@ class PipelineParams(ParamGroup):
     def __init__(self, parser):
         self.convert_SHs_python = False
         self.compute_cov3D_python = False
+        self.depth_ratio = 0.0
         self.debug = False
         super().__init__(parser, "Pipeline Parameters")
 
 class OptimizationParams(ParamGroup):
     def __init__(self, parser):
-        self.iterations = 30_000
+        self.iterations = 700
         self.position_lr_init = 0.00016
         self.position_lr_final = 0.0000016
         self.position_lr_delay_mult = 0.01
@@ -86,7 +89,7 @@ class OptimizationParams(ParamGroup):
         self.normal_loss = False
         self.sparse_loss = False
         self.flatten_loss = False
-        self.depth_loss = False
+        self.depth_loss = True
         self.depth2normal_loss = False 
         self.lambda_l1_normal = 0.01
         self.lambda_cos_normal = 0.01
@@ -104,10 +107,10 @@ class OptimizationParams(ParamGroup):
 
         #propagation parameters
         self.dataset = 'waymo'
-        self.propagation_interval = 200
+        self.propagation_interval = 100
         self.depth_error_min_threshold = 1.0
         self.depth_error_max_threshold = 1.0
-        self.propagated_iteration_begin = 1000
+        self.propagated_iteration_begin = 500
         self.propagated_iteration_after = 12000
         self.patch_size = 20
         self.pair_path = ''
