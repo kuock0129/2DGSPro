@@ -7,7 +7,7 @@
 # under the terms of the LICENSE.md file.
 #
 # For inquiries contact  george.drettakis@inria.fr
-#
+# 2DGS
 
 import os
 import torch

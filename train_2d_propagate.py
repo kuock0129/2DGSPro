@@ -1,4 +1,4 @@
- #
+#
 # Copyright (C) 2023, Inria
 # GRAPHDECO research group, https://team.inria.fr/graphdeco
 # All rights reserved.
@@ -7,7 +7,7 @@
 # under the terms of the LICENSE.md file.
 #
 # For inquiries contact  george.drettakis@inria.fr
-#
+# 2DGSPro - training_2d_propagate.py
 
 import os
 import torch
@@ -20,7 +20,7 @@ from gaussian_renderer import render2D as render
 from utils.graphics_utils import surface_normal_from_depth, img_warping, depth_propagation, check_geometric_consistency, generate_edge_mask
 import sys
 from scene import Scene
-from scene import GaussianModel2D as GaussianModel
+from scene import GaussianModel2D as GaussianModel # import 2D Gaussian model
 from utils.general_utils import safe_state, load_pairs_relation
 import uuid
 from tqdm import tqdm
@@ -38,14 +38,86 @@ except ImportError:
     TENSORBOARD_FOUND = False
 
 
+# NEW: Surface consistency loss functions
+def compute_surface_consistency_loss(rendered_normals, surfel_normals, visibility_filter):
+    """
+    Compute loss to ensure rendered normals match surfel normals
+    """
+    if rendered_normals is None or surfel_normals.numel() == 0:
+        return torch.tensor(0.0, device="cuda")
+    
+    # Get visible surfel normals
+    visible_surfel_normals = surfel_normals[visibility_filter]
+    
+    if visible_surfel_normals.numel() == 0:
+        return torch.tensor(0.0, device="cuda")
+    
+    # Flatten rendered normals for comparison
+    rendered_flat = rendered_normals.view(3, -1).transpose(0, 1)  # [H*W, 3]
+    
+    # Simple L2 loss between rendered and surfel normals
+    if rendered_flat.shape[0] != visible_surfel_normals.shape[0]:
+        # If dimensions don't match, use mean normal
+        mean_surfel_normal = torch.mean(visible_surfel_normals, dim=0, keepdim=True)
+        mean_rendered_normal = torch.mean(rendered_flat, dim=0, keepdim=True)
+        loss = torch.nn.functional.mse_loss(mean_rendered_normal, mean_surfel_normal)
+    else:
+        loss = torch.nn.functional.mse_loss(rendered_flat, visible_surfel_normals)
+    
+    return loss
+
+
+def compute_depth_surface_alignment(rendered_depth, surfel_positions, surfel_normals, viewpoint_cam):
+    """
+    Compute loss to ensure depth is consistent with surface orientation
+    """
+    if rendered_depth is None or surfel_positions.numel() == 0:
+        return torch.tensor(0.0, device="cuda")
+    
+    # Project surfel positions to image space
+    K = viewpoint_cam.K
+    w2c = viewpoint_cam.world_view_transform.transpose(0, 1)
+    
+    # Transform to camera coordinates
+    surfel_cam = (w2c[:3, :3] @ surfel_positions.T + w2c[:3, 3:4]).T  # [N, 3]
+    
+    # Project to image plane
+    surfel_proj = K @ surfel_cam.T  # [3, N]
+    surfel_depths = surfel_proj[2, :]  # [N]
+    surfel_pixels = surfel_proj[:2, :] / surfel_proj[2:3, :]  # [2, N]
+    
+    # Filter valid projections
+    H, W = rendered_depth.shape
+    valid_mask = (
+        (surfel_pixels[0, :] >= 0) & (surfel_pixels[0, :] < W) &
+        (surfel_pixels[1, :] >= 0) & (surfel_pixels[1, :] < H) &
+        (surfel_depths > 0)
+    )
+    
+    if not valid_mask.any():
+        return torch.tensor(0.0, device="cuda")
+    
+    # Sample rendered depth at surfel pixel locations
+    valid_pixels = surfel_pixels[:, valid_mask].long()
+    valid_depths = surfel_depths[valid_mask]
+    
+    sampled_depths = rendered_depth[valid_pixels[1], valid_pixels[0]]
+    
+    # Depth consistency loss
+    depth_loss = torch.nn.functional.mse_loss(sampled_depths, valid_depths)
+    
+    return depth_loss
+
+
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from):
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
+    # Initialize the scene and Gaussian model
     gaussians = GaussianModel(dataset.sh_degree)
     scene = Scene(dataset, gaussians)
     
     #read the overlapping txt
-    if opt.dataset == '360' and opt.depth_loss:
+    if hasattr(opt, 'dataset') and opt.dataset == '360' and hasattr(opt, 'depth_loss') and opt.depth_loss:
         pairs = load_pairs_relation(opt.pair_path)
     
     gaussians.training_setup(opt)
@@ -63,15 +135,29 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     ema_loss_for_log = 0.0
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
-    # depth_loss_fn = ScaleAndShiftInvariantLoss(alpha=0.1, scales=1)
-    propagated_iteration_begin = opt.propagated_iteration_begin
-    propagated_iteration_after = opt.propagated_iteration_after
-    after_propagated = False
+    
+    # Initialize propagation parameters with safe defaults
+    propagated_iteration_begin = getattr(opt, 'propagated_iteration_begin', 15000)
+    propagated_iteration_after = getattr(opt, 'propagated_iteration_after', 25000)
     propagation_dict = {}
     for i in range(0, len(viewpoint_stack), 1):
         propagation_dict[viewpoint_stack[i].image_name] = False
 
-    for iteration in range(first_iter, opt.iterations + 1):        
+    for iteration in range(first_iter, opt.iterations + 1):
+        if network_gui.conn == None:
+            network_gui.try_connect()
+        while network_gui.conn != None:
+            try:
+                net_image_bytes = None
+                custom_cam, do_training, pipe.convert_SHs_python, pipe.compute_cov3D_python, keep_alive, scaling_modifer = network_gui.receive()
+                if custom_cam != None:
+                    net_image = render(custom_cam, gaussians, pipe, background, scaling_modifer)["render"]
+                    net_image_bytes = memoryview((torch.clamp(net_image, min=0, max=1.0) * 255).byte().permute(1, 2, 0).contiguous().cpu().numpy())
+                network_gui.send(net_image_bytes, dataset.source_path)
+                if do_training and ((iteration < int(opt.iterations)) or not keep_alive):
+                    break
+            except Exception as e:
+                network_gui.conn = None
 
         iter_start.record()
 
@@ -82,134 +168,154 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             gaussians.oneupSHdegree()
 
         # Pick a random Camera
-        # if not viewpoint_stack:
-        #     viewpoint_stack = scene.getTrainCameras().copy()
         randidx = randint(0, len(viewpoint_stack)-1)
-        # if iteration > propagated_iteration_begin and iteration < propagated_iteration_after and after_propagated:
-        #     randidx = propagated_view_index
         viewpoint_cam = viewpoint_stack[randidx]
         
-        if opt.depth_loss:
-            if opt.dataset == '360':
-                src_idxs = pairs[randidx]
+        # Initialize src_idxs for depth propagation
+        src_idxs = []
+        if hasattr(opt, 'depth_loss') and opt.depth_loss:
+            if hasattr(opt, 'dataset') and opt.dataset == '360':
+                src_idxs = pairs[randidx] if 'pairs' in locals() else []
             else:
-                # intervals = [-6, -3, 3, 6]
-                if opt.dataset == 'waymo':
-                    intervals = [-2, -1, 1, 2]
-                elif opt.dataset == 'scannet':
-                    intervals = [-10, -5, 5, 10]
-                elif opt.dataset == 'free':
-                    intervals = [-2, -1, 1, 2]
+                # Set intervals based on dataset
+                if hasattr(opt, 'dataset'):
+                    if opt.dataset == 'waymo':
+                        intervals = [-2, -1, 1, 2]
+                    elif opt.dataset == 'scannet':
+                        intervals = [-10, -5, 5, 10]
+                    elif opt.dataset == 'free':
+                        intervals = [-2, -1, 1, 2]
+                    else:
+                        intervals = [-2, -1, 1, 2]  # default
+                else:
+                    intervals = [-2, -1, 1, 2]  # default
+                    
                 src_idxs = [randidx+itv for itv in intervals if ((itv + randidx > 0) and (itv + randidx < len(viewpoint_stack)))]
 
-        #propagate the gaussians first
+        # Propagate the gaussians first
         with torch.no_grad():
-           if opt.depth_loss and iteration > propagated_iteration_begin and iteration < propagated_iteration_after and (iteration % opt.propagation_interval == 0):
-            # if opt.depth_loss and iteration > propagated_iteration_begin and iteration < propagated_iteration_after and (iteration % opt.propagation_interval == 0):
+            if (hasattr(opt, 'depth_loss') and opt.depth_loss and 
+                iteration > propagated_iteration_begin and 
+                iteration < propagated_iteration_after and 
+                hasattr(opt, 'propagation_interval') and 
+                (iteration % opt.propagation_interval == 0)):
                 
                 propagation_dict[viewpoint_cam.image_name] = True
 
-                render_pkg = render(viewpoint_cam, gaussians, pipe, bg, 
-                            return_normal=opt.normal_loss, return_opacity=False, return_depth=opt.depth_loss or opt.depth2normal_loss)
+                # FIX: Use 'background' instead of undefined 'bg'
+                render_pkg = render(viewpoint_cam, gaussians, pipe, background, 
+                            return_normal=getattr(opt, 'normal_loss', False), 
+                            return_opacity=False, 
+                            return_depth=getattr(opt, 'depth_loss', False) or getattr(opt, 'depth2normal_loss', False))
 
                 projected_depth = render_pkg["render_depth"]
 
-                # get the opacity that less than the threshold, propagate depth in these region
-                if viewpoint_cam.sky_mask is not None:
-                    sky_mask = viewpoint_cam.sky_mask.to(opacity_mask.device).to(torch.bool)
-                else:
-                    sky_mask = None
-                # torchvision.utils.save_image(viewpoint_cam.original_image, "cost/"+viewpoint_cam.image_name+"_"+str(iteration)+"gt.png")
+                # Handle sky mask safely
+                sky_mask = None
+                if hasattr(viewpoint_cam, 'sky_mask') and viewpoint_cam.sky_mask is not None:
+                    sky_mask = viewpoint_cam.sky_mask.to(projected_depth.device).to(torch.bool)
 
-                # get the propagated depth
-                propagated_depth, normal = depth_propagation(viewpoint_cam, projected_depth, viewpoint_stack, src_idxs, opt.dataset, opt.patch_size)
-
-                # cache the propagated_depth
-                viewpoint_cam.depth = propagated_depth
-
-                #transform normal to camera coordinate
-                R_w2c = torch.tensor(viewpoint_cam.R.T).cuda().to(torch.float32)
-                # R_w2c[:, 1:] *= -1
-                normal = (R_w2c @ normal.view(-1, 3).permute(1, 0)).view(3, viewpoint_cam.image_height, viewpoint_cam.image_width)                
-                valid_mask = propagated_depth != 300
-
-                # calculate the abs rel depth error of the propagated depth and rendered depth & render color error
-                render_depth = render_pkg['render_depth']
-                abs_rel_error = torch.abs(propagated_depth - render_depth) / propagated_depth
-                abs_rel_error = abs_rel_error.squeeze()
-                abs_rel_error_threshold = opt.depth_error_max_threshold - (opt.depth_error_max_threshold - opt.depth_error_min_threshold) * (iteration - propagated_iteration_begin) / (propagated_iteration_after - propagated_iteration_begin)
-                # color error
-                render_color = render_pkg['render']
-                # torchvision.utils.save_image(render_color, "cost/"+viewpoint_cam.image_name+"_"+str(iteration)+"color.png")
-
-                color_error = torch.abs(render_color - viewpoint_cam.original_image)
-                color_error = color_error.mean(dim=0).squeeze()
-                error_mask = (abs_rel_error > abs_rel_error_threshold)
-
-                # # calculate the photometric consistency
-                ref_K = viewpoint_cam.K
-                #c2w
-                ref_pose = viewpoint_cam.world_view_transform.transpose(0, 1).inverse()
-                
-                # calculate the geometric consistency
-                geometric_counts = None
-                for idx, src_idx in enumerate(src_idxs):
-                    src_viewpoint = viewpoint_stack[src_idx]
-                    #c2w
-                    src_pose = src_viewpoint.world_view_transform.transpose(0, 1).inverse()
-                    src_K = src_viewpoint.K
-
-                    if src_viewpoint.depth is None:
-                        src_render_pkg = render(src_viewpoint, gaussians, pipe, bg, 
-                                return_normal=opt.normal_loss, return_opacity=False, return_depth=opt.depth_loss or opt.depth2normal_loss)
-                        src_projected_depth = src_render_pkg['render_depth']
-                    
-                    #get the src_depth first
-                        src_depth, src_normal = depth_propagation(src_viewpoint, src_projected_depth, viewpoint_stack, src_idxs, opt.dataset, opt.patch_size)
-                        src_viewpoint.depth = src_depth
-                    else:
-                        src_depth = src_viewpoint.depth
-                    mask, depth_reprojected, x2d_src, y2d_src, relative_depth_diff = check_geometric_consistency(propagated_depth.unsqueeze(0), ref_K.unsqueeze(0), 
-                                                                                                                 ref_pose.unsqueeze(0), src_depth.unsqueeze(0), 
-                                                                                                                 src_K.unsqueeze(0), src_pose.unsqueeze(0), thre1=2, thre2=0.01)
-                    if geometric_counts is None:
-                        geometric_counts = mask.to(torch.uint8)
-                    else:
-                        geometric_counts += mask.to(torch.uint8)
+                # FIX: Use standard depth propagation instead of undefined method
+                if len(src_idxs) > 0:
+                    try:
+                        # Standard depth propagation
+                        propagated_depth, normal = depth_propagation(
+                            viewpoint_cam, projected_depth, viewpoint_stack, src_idxs, 
+                            getattr(opt, 'dataset', 'default'), 
+                            getattr(opt, 'patch_size', 11)
+                        )
                         
-                cost = geometric_counts.squeeze()
-                cost_mask = cost >= 2       
-                
-                normal[~(cost_mask.unsqueeze(0).repeat(3, 1, 1))] = -10
-                viewpoint_cam.normal = normal
-                
-                propagated_mask = valid_mask & error_mask & cost_mask
-                if sky_mask is not None:
-                    propagated_mask = propagated_mask & sky_mask
+                        # Cache the propagated_depth
+                        viewpoint_cam.depth = propagated_depth
+                        
+                        # Transform normal to camera coordinate
+                        if hasattr(viewpoint_cam, 'R'):
+                            R_w2c = torch.tensor(viewpoint_cam.R.T).cuda().to(torch.float32)
+                            normal = (R_w2c @ normal.view(-1, 3).permute(1, 0)).view(3, viewpoint_cam.image_height, viewpoint_cam.image_width)
+                            viewpoint_cam.normal = normal
+                        
+                        valid_mask = propagated_depth != 300
 
-                propagated_depth[~cost_mask] = 300 
-                # propagated_mask = propagated_mask & edge_mask
-                propagated_depth[~propagated_mask] = 300
-  
-                if propagated_mask.sum() > 100:
-                    gaussians.densify_from_depth_propagation(viewpoint_cam, propagated_depth, propagated_mask.to(torch.bool), gt_image)
+                        # Calculate error metrics
+                        render_depth = render_pkg['render_depth']
+                        abs_rel_error = torch.abs(propagated_depth - render_depth) / (propagated_depth + 1e-8)
+                        abs_rel_error = abs_rel_error.squeeze()
+                        
+                        # Use safe defaults for thresholds
+                        depth_error_max = getattr(opt, 'depth_error_max_threshold', 0.1)
+                        depth_error_min = getattr(opt, 'depth_error_min_threshold', 0.01)
+                        abs_rel_error_threshold = depth_error_max - (depth_error_max - depth_error_min) * (iteration - propagated_iteration_begin) / (propagated_iteration_after - propagated_iteration_begin)
+                        
+                        error_mask = (abs_rel_error > abs_rel_error_threshold)
 
-                
+                        # Geometric consistency check
+                        ref_K = viewpoint_cam.K
+                        ref_pose = viewpoint_cam.world_view_transform.transpose(0, 1).inverse()
+                        
+                        geometric_counts = None
+                        for idx, src_idx in enumerate(src_idxs):
+                            src_viewpoint = viewpoint_stack[src_idx]
+                            src_pose = src_viewpoint.world_view_transform.transpose(0, 1).inverse()
+                            src_K = src_viewpoint.K
+
+                            if not hasattr(src_viewpoint, 'depth') or src_viewpoint.depth is None:
+                                src_render_pkg = render(src_viewpoint, gaussians, pipe, background, 
+                                        return_normal=getattr(opt, 'normal_loss', False), 
+                                        return_opacity=False, 
+                                        return_depth=True)
+                                src_projected_depth = src_render_pkg['render_depth']
+                                
+                                src_depth, _ = depth_propagation(src_viewpoint, src_projected_depth, viewpoint_stack, src_idxs, 
+                                                               getattr(opt, 'dataset', 'default'), getattr(opt, 'patch_size', 11))
+                                src_viewpoint.depth = src_depth
+                            else:
+                                src_depth = src_viewpoint.depth
+                                
+                            mask, depth_reprojected, x2d_src, y2d_src, relative_depth_diff = check_geometric_consistency(
+                                propagated_depth.unsqueeze(0), ref_K.unsqueeze(0), 
+                                ref_pose.unsqueeze(0), src_depth.unsqueeze(0), 
+                                src_K.unsqueeze(0), src_pose.unsqueeze(0), thre1=2, thre2=0.01)
+                            
+                            if geometric_counts is None:
+                                geometric_counts = mask.to(torch.uint8)
+                            else:
+                                geometric_counts += mask.to(torch.uint8)
+                                
+                        cost = geometric_counts.squeeze()
+                        cost_mask = cost >= 2
+                        
+                        propagated_mask = valid_mask & error_mask & cost_mask
+                        if sky_mask is not None:
+                            propagated_mask = propagated_mask & sky_mask
+
+                        propagated_depth[~cost_mask] = 300 
+                        propagated_depth[~propagated_mask] = 300
+          
+                        if propagated_mask.sum() > 100:
+                            # FIX: Use viewpoint_cam.original_image instead of undefined gt_image
+                            gaussians.densify_from_depth_propagation(
+                                viewpoint_cam, propagated_depth, propagated_mask.to(torch.bool), 
+                                viewpoint_cam.original_image
+                            )
+                            
+                    except Exception as e:
+                        print(f"Depth propagation failed: {e}")
+                        # Continue training without propagation
+
         # Render
         if (iteration - 1) == debug_from:
             pipe.debug = True
 
-        bg = torch.rand((3), device="cuda") if opt.random_background else background
+        bg = torch.rand((3), device="cuda") if getattr(opt, 'random_background', False) else background
 
-        #render_pkg = render(viewpoint_cam, gaussians, pipe, bg, return_normal=args.normal_loss)
         render_pkg = render(viewpoint_cam, gaussians, pipe, bg, 
-                            return_normal=opt.normal_loss, return_opacity=True, return_depth=opt.depth_loss or opt.depth2normal_loss)
+                            return_normal=getattr(opt, 'normal_loss', False), 
+                            return_opacity=True, 
+                            return_depth=getattr(opt, 'depth_loss', False) or getattr(opt, 'depth2normal_loss', False))
         image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
-        
 
-        # opacity mask
-
-        if iteration < opt.propagated_iteration_begin and opt.depth_loss:
+        # Opacity mask
+        if iteration < propagated_iteration_begin and hasattr(opt, 'depth_loss') and opt.depth_loss:
             opacity_mask = render_pkg['render_opacity'] > 0.999
             if len(opacity_mask.shape) == 2:
                 opacity_mask = opacity_mask.unsqueeze(0)
@@ -220,44 +326,70 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 opacity_mask = opacity_mask.unsqueeze(0)
             opacity_mask = opacity_mask.repeat(3, 1, 1)
 
-        # Loss
+        # Loss computation
         gt_image = viewpoint_cam.original_image.cuda()
-
         Ll1 = l1_loss(image[opacity_mask], gt_image[opacity_mask])
-        loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image, mask=opacity_mask))
+        lambda_dssim = getattr(opt, 'lambda_dssim', 0.2)
+        loss = (1.0 - lambda_dssim) * Ll1 + lambda_dssim * (1.0 - ssim(image, gt_image, mask=opacity_mask))
 
-        # flatten loss
-        if opt.flatten_loss:
+        # Flatten loss
+        if hasattr(opt, 'flatten_loss') and opt.flatten_loss:
             scales = gaussians.get_scaling
             min_scale, _ = torch.min(scales, dim=1)
             min_scale = torch.clamp(min_scale, 0, 30)
             flatten_loss = torch.abs(min_scale).mean()
-            loss += opt.lambda_flatten * flatten_loss
+            lambda_flatten = getattr(opt, 'lambda_flatten', 0.01)
+            loss += lambda_flatten * flatten_loss
 
-        # opacity loss
-        if opt.sparse_loss:
+        # Opacity loss
+        if hasattr(opt, 'sparse_loss') and opt.sparse_loss:
             opacity = gaussians.get_opacity
             opacity = opacity.clamp(1e-6, 1-1e-6)
             log_opacity = opacity * torch.log(opacity)
             log_one_minus_opacity = (1-opacity) * torch.log(1 - opacity)
             sparse_loss = -1 * (log_opacity + log_one_minus_opacity)[visibility_filter].mean()
-            loss += opt.lambda_sparse * sparse_loss
+            lambda_sparse = getattr(opt, 'lambda_sparse', 0.01)
+            loss += lambda_sparse * sparse_loss
 
-        if opt.normal_loss:
-            rendered_normal = render_pkg['render_normal']
-            if viewpoint_cam.normal is not None:
+        # Surface consistency loss
+        if hasattr(opt, 'surface_loss') and opt.surface_loss:
+            surface_loss = compute_surface_consistency_loss(
+                rendered_normals=render_pkg.get('render_normal'),
+                surfel_normals=gaussians.get_normals(),
+                visibility_filter=visibility_filter
+            )
+            lambda_surface = getattr(opt, 'lambda_surface', 0.1)
+            loss += lambda_surface * surface_loss
+
+        # Depth-surface alignment loss
+        if hasattr(opt, 'depth_surface_loss') and opt.depth_surface_loss:
+            depth_surface_loss = compute_depth_surface_alignment(
+                rendered_depth=render_pkg.get('render_depth'),
+                surfel_positions=gaussians.get_xyz,
+                surfel_normals=gaussians.get_normals(),
+                viewpoint_cam=viewpoint_cam
+            )
+            lambda_depth_surface = getattr(opt, 'lambda_depth_surface', 0.1)
+            loss += lambda_depth_surface * depth_surface_loss
+
+        # Normal loss
+        if hasattr(opt, 'normal_loss') and opt.normal_loss:
+            rendered_normal = render_pkg.get('render_normal')
+            if rendered_normal is not None and hasattr(viewpoint_cam, 'normal') and viewpoint_cam.normal is not None:
                 normal_gt = viewpoint_cam.normal.cuda()
-                if viewpoint_cam.sky_mask is not None:
+                if hasattr(viewpoint_cam, 'sky_mask') and viewpoint_cam.sky_mask is not None:
                     filter_mask = viewpoint_cam.sky_mask.to(normal_gt.device).to(torch.bool)
                     normal_gt[~(filter_mask.unsqueeze(0).repeat(3, 1, 1))] = -10
                 filter_mask = (normal_gt != -10)[0, :, :].to(torch.bool)
 
                 l1_normal = torch.abs(rendered_normal - normal_gt).sum(dim=0)[filter_mask].mean()
                 cos_normal = (1. - torch.sum(rendered_normal * normal_gt, dim = 0))[filter_mask].mean()
-                loss += opt.lambda_l1_normal * l1_normal + opt.lambda_cos_normal * cos_normal
+                
+                lambda_l1_normal = getattr(opt, 'lambda_l1_normal', 0.05)
+                lambda_cos_normal = getattr(opt, 'lambda_cos_normal', 0.05)
+                loss += lambda_l1_normal * l1_normal + lambda_cos_normal * cos_normal
 
         loss.backward()
-
         iter_end.record()
 
         with torch.no_grad():
@@ -277,30 +409,34 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 scene.save(iteration)
 
             # Densification
-            if iteration < opt.densify_until_iter:
+            densify_until_iter = getattr(opt, 'densify_until_iter', 15000)
+            if iteration < densify_until_iter:
                 # Keep track of max radii in image-space for pruning
                 gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
                 gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
 
-                if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
-                    size_threshold = 20 if iteration > opt.opacity_reset_interval else None
-                    print(f"Densitify with {gaussians.get_xyz.shape[0]} points")
-                    gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold)
-
+                densify_from_iter = getattr(opt, 'densify_from_iter', 500)
+                densification_interval = getattr(opt, 'densification_interval', 100)
+                opacity_reset_interval = getattr(opt, 'opacity_reset_interval', 3000)
                 
-                if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
+                if iteration > densify_from_iter and iteration % densification_interval == 0:
+                    size_threshold = 20 if iteration > opacity_reset_interval else None
+                    print(f"Densify with {gaussians.get_xyz.shape[0]} points")
+                    densify_grad_threshold = getattr(opt, 'densify_grad_threshold', 0.0002)
+                    gaussians.densify_and_prune(densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold)
+                
+                if iteration % opacity_reset_interval == 0 or (dataset.white_background and iteration == densify_from_iter):
                     gaussians.reset_opacity()
 
             # Optimizer step
             if iteration < opt.iterations:
                 gaussians.optimizer.step()
                 gaussians.optimizer.zero_grad(set_to_none = True)
-                
-               
 
             if (iteration in checkpoint_iterations):
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
                 torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
+
 
 def prepare_output_and_logger(args):    
     if not args.model_path:
@@ -323,6 +459,7 @@ def prepare_output_and_logger(args):
     else:
         print("Tensorboard not available: not logging progress")
     return tb_writer
+
 
 def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs):
     if tb_writer:
@@ -361,6 +498,7 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
             tb_writer.add_scalar('total_points', scene.gaussians.get_xyz.shape[0], iteration)
         torch.cuda.empty_cache()
 
+
 if __name__ == "__main__":
     # Set up command line argument parser
     parser = ArgumentParser(description="Training script parameters")
@@ -386,6 +524,7 @@ if __name__ == "__main__":
     safe_state(args.quiet)
 
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
+    # Start the training
     training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from)
 
     # All done

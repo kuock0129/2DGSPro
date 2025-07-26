@@ -7,7 +7,9 @@
 # under the terms of the LICENSE.md file.
 #
 # For inquiries contact  george.drettakis@inria.fr
-#
+
+
+# 2DGSPro - a 2D Gaussian Splatting Projec
 
 import torch
 import math
@@ -161,6 +163,9 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
 
     return return_dict
 
+
+# 2DGS gaussian_renderer
+
 from diff_surfel_rasterization import GaussianRasterizationSettings as GaussianRasterizationSettings2d
 from diff_surfel_rasterization import GaussianRasterizer as GaussianRasterizer2d
 from scene.gaussian_model import GaussianModel
@@ -294,10 +299,10 @@ def render2D(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor
     surf_depth = render_depth_expected * (1-pipe.depth_ratio) + (pipe.depth_ratio) * render_depth_median
     
     # assume the depth points form the 'surface' and generate psudo surface normal for regularizations.
-    # surf_normal = depth_to_normal(viewpoint_camera, surf_depth)
-    # surf_normal = surf_normal.permute(2,0,1)
+    surf_normal = depth_to_normal(viewpoint_camera, surf_depth)
+    surf_normal = surf_normal.permute(2,0,1)
     # remember to multiply with accum_alpha since render_normal is unnormalized.
-    # surf_normal = surf_normal * (render_alpha).detach()
+    surf_normal = surf_normal * (render_alpha).detach()
 
 
     rets.update({

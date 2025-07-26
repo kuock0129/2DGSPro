@@ -437,7 +437,321 @@ def depth_propagation(viewpoint_cam, rendered_depth, viewpoint_stack, src_idxs, 
     
     return propagated_depth, propagated_normal
 
+
+"--------------NEW ADD---------------------"
+
+def project_surfels_to_view(self, surfel_positions, viewpoint_cam):
+    """Project 3D surfel positions to 2D image coordinates"""
+    w2c = viewpoint_cam.world_view_transform.transpose(0, 1)
+    cam_positions = (w2c[:3, :3] @ surfel_positions.T + w2c[:3, 3:4]).T
     
+    K = viewpoint_cam.K
+    image_coords = (K @ cam_positions.T).T
+    pixels = image_coords[:, :2] / image_coords[:, 2:3]
+    return pixels
+
+def propagate_with_surfel_guidance(self, viewpoint_cam, src_views, rendered_depth):
+    """
+    True 2DGS + GaussianPro integration: Use explicit surfel normals for propagation
+    """
+    height, width = rendered_depth.shape
+    K = viewpoint_cam.K
+    cam2world = viewpoint_cam.world_view_transform.transpose(0, 1).inverse()
+    
+    # Get existing surfel information
+    surfel_positions = self.get_xyz  # [N, 3]
+    surfel_normals = self.get_normals()  # [N, 3] - fixed implementation needed
+    surfel_opacities = self.get_opacity  # [N, 1]
+    
+    # Project surfels to current view
+    projected_surfels = project_surfels_to_view(surfel_positions, viewpoint_cam)
+    
+    propagated_depth = rendered_depth.clone()
+    confidence_map = torch.zeros_like(rendered_depth)
+    
+    # For each pixel that needs propagation
+    low_confidence_mask = rendered_depth < 0.01  # or opacity-based mask
+    
+    for y in range(height):
+        for x in range(width):
+            if not low_confidence_mask[y, x]:
+                continue
+                
+            # Find nearest projected surfel
+            pixel_coord = torch.tensor([x, y], device=rendered_depth.device)
+            distances = torch.norm(projected_surfels - pixel_coord, dim=1)
+            nearest_idx = torch.argmin(distances)
+            
+            # Skip if surfel is too far or has low opacity
+            if distances[nearest_idx] > 10 or surfel_opacities[nearest_idx] < 0.1:
+                continue
+                
+            # Get surfel's surface information
+            surfel_pos = surfel_positions[nearest_idx]
+            surfel_normal = surfel_normals[nearest_idx]
+            
+            # Propagate depth using surface-aware patch matching
+            propagated_value = surface_aware_patch_match(
+                pixel_coord=(x, y),
+                surfel_position=surfel_pos,
+                surface_normal=surfel_normal,  # ← KEY: True surface normal
+                reference_view=viewpoint_cam,
+                source_views=src_views,
+                patch_size=11
+            )
+            
+            if propagated_value is not None:
+                propagated_depth[y, x] = propagated_value
+                confidence_map[y, x] = 1.0
+    
+    return propagated_depth, confidence_map
+
+
+def surface_aware_patch_match(self, pixel_coord, surfel_position, surface_normal, 
+                             reference_view, source_views, patch_size=11):
+    """
+    Enhanced patch matching using explicit surface geometry
+    """
+    x, y = pixel_coord
+    
+    # Create depth hypothesis based on surface plane
+    # Plane equation: n·(p - surfel_pos) = 0
+    # This gives us a local depth hypothesis around the surfel
+    
+    best_depth = None
+    best_cost = float('inf')
+    
+    # Test multiple depth hypotheses along the surface normal
+    depth_range = torch.linspace(0.1, 10.0, 32, device=surface_normal.device)
+    
+    for depth_hyp in depth_range:
+        # 3D point hypothesis
+        point_3d = unproject_pixel(x, y, depth_hyp, reference_view.K)
+        
+        # Check if point lies on the surfel's surface plane
+        plane_distance = torch.abs(torch.dot(surface_normal, point_3d - surfel_position))
+        
+        # Weight cost by surface consistency
+        surface_weight = torch.exp(-plane_distance * 10)  # Prefer points on surface
+        
+        # Standard photometric cost across source views
+        photo_cost = 0
+        valid_views = 0
+        
+        for src_view in source_views:
+            # Project to source view
+            src_pixel = project_3d_to_2d(point_3d, src_view)
+            
+            if is_valid_pixel(src_pixel, src_view.image_height, src_view.image_width):
+                # Extract patches
+                ref_patch = extract_patch(reference_view.original_image, x, y, patch_size)
+                src_patch = extract_patch(src_view.original_image, src_pixel[0], src_pixel[1], patch_size)
+                
+                # Photometric cost
+                patch_cost = torch.mean(torch.abs(ref_patch - src_patch))
+                photo_cost += patch_cost
+                valid_views += 1
+        
+        if valid_views > 0:
+            avg_photo_cost = photo_cost / valid_views
+            # Combine photometric and surface consistency
+            total_cost = avg_photo_cost / surface_weight  # Lower cost for surface-consistent points
+            
+            if total_cost < best_cost:
+                best_cost = total_cost
+                best_depth = depth_hyp
+    
+    return best_depth if best_cost < 0.1 else None
+
+
+    def unproject_pixel(x, y, depth, K):
+    """Convert 2D pixel coordinates + depth to 3D point in camera space"""
+    fx, fy = K[0, 0], K[1, 1]
+    cx, cy = K[0, 2], K[1, 2]
+    
+    # Convert to camera coordinates
+    x_cam = (x - cx) * depth / fx
+    y_cam = (y - cy) * depth / fy
+    z_cam = depth
+    
+    return torch.tensor([x_cam, y_cam, z_cam], device=K.device, dtype=torch.float32)
+
+def project_3d_to_2d(point_3d, viewpoint_cam):
+    """Project 3D point to 2D pixel coordinates"""
+    try:
+        # Transform to camera coordinates
+        w2c = viewpoint_cam.world_view_transform.transpose(0, 1)
+        point_cam = w2c[:3, :3] @ point_3d + w2c[:3, 3]
+        
+        # Project to image plane
+        K = viewpoint_cam.K
+        point_2d = K @ point_cam
+        
+        if point_2d[2] <= 0:  # Behind camera
+            return None
+            
+        pixel = point_2d[:2] / point_2d[2]
+        return pixel
+    except:
+        return None
+
+def extract_patch(image, x, y, patch_size):
+    """Extract image patch around pixel coordinates"""
+    try:
+        half_patch = patch_size // 2
+        h, w = image.shape[-2:]
+        
+        # Calculate patch boundaries
+        x_start = max(0, int(x - half_patch))
+        x_end = min(w, int(x + half_patch + 1))
+        y_start = max(0, int(y - half_patch))
+        y_end = min(h, int(y + half_patch + 1))
+        
+        # Extract patch
+        if len(image.shape) == 3:  # [C, H, W]
+            patch = image[:, y_start:y_end, x_start:x_end]
+        else:  # [H, W, C] or [H, W]
+            patch = image[y_start:y_end, x_start:x_end]
+            
+        return patch
+    except:
+        return None
+
+def is_valid_pixel(pixel, height, width):
+    """Check if pixel coordinates are within image bounds"""
+    if pixel is None:
+        return False
+    x, y = pixel
+    return 0 <= x < width and 0 <= y < height
+
+# Fix the function signatures (remove 'self' parameter)
+def propagate_with_surfel_guidance(gaussians, viewpoint_cam, src_views, rendered_depth):
+    """
+    Enhanced depth propagation using 2DGS surfel information
+    """
+    height, width = rendered_depth.shape
+    K = viewpoint_cam.K
+    
+    # Get existing surfel information
+    surfel_positions = gaussians.get_xyz  # [N, 3]
+    surfel_normals = gaussians.get_normals()  # [N, 3]
+    surfel_opacities = gaussians.get_opacity  # [N, 1]
+    
+    if surfel_positions.numel() == 0:
+        return rendered_depth, torch.zeros_like(rendered_depth)
+    
+    # Project surfels to current view
+    projected_surfels = project_surfels_to_view(surfel_positions, viewpoint_cam)
+    
+    propagated_depth = rendered_depth.clone()
+    confidence_map = torch.zeros_like(rendered_depth)
+    
+    # For pixels that need propagation
+    low_confidence_mask = rendered_depth < 0.01
+    
+    # Vectorized approach for efficiency
+    y_coords, x_coords = torch.where(low_confidence_mask)
+    
+    for i in range(len(y_coords)):
+        y, x = y_coords[i].item(), x_coords[i].item()
+        
+        # Find nearest projected surfel
+        pixel_coord = torch.tensor([x, y], device=rendered_depth.device, dtype=torch.float32)
+        distances = torch.norm(projected_surfels - pixel_coord.unsqueeze(0), dim=1)
+        nearest_idx = torch.argmin(distances)
+        
+        # Skip if surfel is too far or has low opacity
+        if distances[nearest_idx] > 20 or surfel_opacities[nearest_idx] < 0.05:
+            continue
+            
+        # Get surfel's surface information
+        surfel_pos = surfel_positions[nearest_idx]
+        surfel_normal = surfel_normals[nearest_idx]
+        
+        # Simple depth propagation using surface plane
+        try:
+            propagated_value = surface_aware_depth_estimation(
+                pixel_coord=(x, y),
+                surfel_position=surfel_pos,
+                surface_normal=surfel_normal,
+                viewpoint_cam=viewpoint_cam
+            )
+            
+            if propagated_value is not None and propagated_value > 0:
+                propagated_depth[y, x] = propagated_value
+                confidence_map[y, x] = 1.0 / (1.0 + distances[nearest_idx] / 10.0)
+        except:
+            continue
+    
+    return propagated_depth, confidence_map
+
+def surface_aware_depth_estimation(pixel_coord, surfel_position, surface_normal, viewpoint_cam):
+    """
+    Estimate depth for a pixel using surface plane information
+    """
+    x, y = pixel_coord
+    
+    # Camera parameters
+    K = viewpoint_cam.K
+    w2c = viewpoint_cam.world_view_transform.transpose(0, 1)
+    
+    # Convert surfel to camera space
+    surfel_cam = w2c[:3, :3] @ surfel_position + w2c[:3, 3]
+    normal_cam = w2c[:3, :3] @ surface_normal
+    
+    # Ray from camera through pixel
+    fx, fy = K[0, 0], K[1, 1]
+    cx, cy = K[0, 2], K[1, 2]
+    
+    ray_dir = torch.tensor([
+        (x - cx) / fx,
+        (y - cy) / fy,
+        1.0
+    ], device=K.device, dtype=torch.float32)
+    ray_dir = ray_dir / torch.norm(ray_dir)
+    
+    # Intersect ray with surfel plane
+    # Plane equation: normal · (point - surfel_pos) = 0
+    # Ray equation: point = t * ray_dir
+    
+    denominator = torch.dot(normal_cam, ray_dir)
+    if torch.abs(denominator) < 1e-6:  # Ray parallel to plane
+        return None
+        
+    t = torch.dot(normal_cam, surfel_cam) / denominator
+    
+    if t <= 0:  # Intersection behind camera
+        return None
+        
+    return t
+
+def project_surfels_to_view(surfel_positions, viewpoint_cam):
+    """Project 3D surfel positions to 2D image coordinates"""
+    if surfel_positions.numel() == 0:
+        return torch.empty(0, 2, device=surfel_positions.device)
+        
+    w2c = viewpoint_cam.world_view_transform.transpose(0, 1)
+    cam_positions = (w2c[:3, :3] @ surfel_positions.T + w2c[:3, 3:4]).T
+    
+    # Filter points behind camera
+    valid_mask = cam_positions[:, 2] > 0
+    if not valid_mask.any():
+        return torch.empty(0, 2, device=surfel_positions.device)
+    
+    K = viewpoint_cam.K
+    image_coords = (K @ cam_positions[valid_mask].T).T
+    pixels = image_coords[:, :2] / image_coords[:, 2:3]
+    
+    # Create full array with invalid positions marked
+    result = torch.full((surfel_positions.shape[0], 2), -1, device=surfel_positions.device, dtype=torch.float32)
+    result[valid_mask] = pixels
+    
+    return result
+
+"--------------NEW ADD---------------------"
+
+
+
 def generate_edge_mask(propagated_depth, patch_size):
     # img gradient
     x_conv = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]]).view(1, 1, 3, 3).float().cuda()
